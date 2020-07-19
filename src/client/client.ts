@@ -1,5 +1,10 @@
+// replaced by serverPluginHmr when served
+declare const __SW_ENABLED__: boolean
+declare const __PORT__: number
+
 // This file runs in the browser.
 import { HMRRuntime } from 'vue'
+import { HMRPayload, UpdatePayload, MultiUpdatePayload } from '../hmrPayload'
 
 // register service worker
 if ('serviceWorker' in navigator) {
@@ -48,7 +53,8 @@ console.log('[vite] connecting...')
 declare var __VUE_HMR_RUNTIME__: HMRRuntime
 
 const socketProtocol = location.protocol === 'https:' ? 'wss' : 'ws'
-const socket = new WebSocket(`${socketProtocol}://${location.host}`)
+const socketUrl = `${socketProtocol}://${location.hostname}:${__PORT__}`
+const socket = new WebSocket(socketUrl, 'vite-hmr')
 
 function warnFailedFetch(err: Error, path: string | string[]) {
   if (!err.message.match('fetch')) {
@@ -63,71 +69,71 @@ function warnFailedFetch(err: Error, path: string | string[]) {
 
 // Listen for messages
 socket.addEventListener('message', async ({ data }) => {
-  const {
-    type,
-    path,
-    changeSrcPath,
-    id,
-    index,
-    timestamp,
-    customData
-  } = JSON.parse(data)
+  const payload = JSON.parse(data) as HMRPayload | MultiUpdatePayload
+  if (payload.type === 'multi') {
+    payload.updates.forEach(handleMessage)
+  } else {
+    handleMessage(payload)
+  }
+})
 
+async function handleMessage(payload: HMRPayload) {
+  const { path, changeSrcPath, timestamp } = payload as UpdatePayload
   if (changeSrcPath) {
-    await bustSwCache(changeSrcPath)
+    bustSwCache(changeSrcPath)
   }
-  if (path !== changeSrcPath) {
-    await bustSwCache(path)
+  if (path && path !== changeSrcPath) {
+    bustSwCache(path)
   }
-
-  switch (type) {
+  switch (payload.type) {
     case 'connected':
       console.log(`[vite] connected.`)
       break
     case 'vue-reload':
-      import(`${path}?t=${timestamp}`)
-        .then((m) => {
-          __VUE_HMR_RUNTIME__.reload(path, m.default)
-          console.log(`[vite] ${path} reloaded.`)
-        })
-        .catch((err) => warnFailedFetch(err, path))
+      queueUpdate(
+        import(`${path}?t=${timestamp}`)
+          .catch((err) => warnFailedFetch(err, path))
+          .then((m) => () => {
+            __VUE_HMR_RUNTIME__.reload(path, m.default)
+            console.log(`[vite] ${path} reloaded.`)
+          })
+      )
       break
     case 'vue-rerender':
       const templatePath = `${path}?type=template`
-      await bustSwCache(templatePath)
+      bustSwCache(templatePath)
       import(`${templatePath}&t=${timestamp}`).then((m) => {
         __VUE_HMR_RUNTIME__.rerender(path, m.render)
         console.log(`[vite] ${path} template updated.`)
       })
       break
-    case 'vue-style-update':
-      const stylePath = `${path}?type=style&index=${index}`
-      await bustSwCache(stylePath)
-      const content = await import(stylePath + `&t=${timestamp}`)
-      updateStyle(id, content.default)
-      console.log(
-        `[vite] ${path} style${index > 0 ? `#${index}` : ``} updated.`
-      )
-      break
     case 'style-update':
-      await bustSwCache(`${path}?import`)
-      const style = await import(`${path}?t=${timestamp}`)
-      updateStyle(id, style.default)
+      // check if this is referenced in html via <link>
+      const el = document.querySelector(`link[href*='${path}']`)
+      if (el) {
+        bustSwCache(path)
+        el.setAttribute(
+          'href',
+          `${path}${path.includes('?') ? '&' : '?'}t=${timestamp}`
+        )
+        break
+      }
+      // imported CSS
+      const importQuery = path.includes('?') ? '&import' : '?import'
+      bustSwCache(`${path}${importQuery}`)
+      await import(`${path}${importQuery}&t=${timestamp}`)
       console.log(`[vite] ${path} updated.`)
       break
     case 'style-remove':
-      const link = document.getElementById(`vite-css-${id}`)
-      if (link) {
-        document.head.removeChild(link)
-      }
+      removeStyle(payload.id)
       break
     case 'js-update':
-      await updateModule(path, changeSrcPath, timestamp)
+      queueUpdate(updateModule(path, changeSrcPath, timestamp))
       break
     case 'custom':
-      const cbs = customUpdateMap.get(id)
+      const cbs = customUpdateMap.get(payload.id)
       if (cbs) {
-        cbs.forEach((cb) => cb(customData))
+        cbs.forEach((cb) => cb(payload.customData))
       }
       break
     case 'full-reload':
@@ -146,43 +152,116 @@ socket.addEventListener('message', async ({ data }) => {
         location.reload()
       }
   }
-})
+}
+
+let pending = false
+let queued: Promise<(() => void) | undefined>[] = []
+
+/**
+ * buffer multiple hot updates triggered by the same src change
+ * so that they are invoked in the same order they were sent.
+ * (otherwise the order may be inconsistent because of the http request round trip)
+ */
+async function queueUpdate(p: Promise<(() => void) | undefined>) {
+  queued.push(p)
+  if (!pending) {
+    pending = true
+    await Promise.resolve()
+    pending = false
+    const loading = [...queued]
+    queued = []
+    ;(await Promise.all(loading)).forEach((fn) => fn && fn())
+  }
+}
 
 // ping server
 socket.addEventListener('close', () => {
   console.log(`[vite] server connection lost. polling for restart...`)
   setInterval(() => {
-    new WebSocket(`${socketProtocol}://${location.host}`).addEventListener(
-      'open',
-      () => {
+    fetch('/')
+      .then(() => {
         location.reload()
-      }
-    )
+      })
+      .catch((e) => {
+        /* ignore */
+      })
   }, 1000)
 })
 
+// https://wicg.github.io/construct-stylesheets
+const supportsConstructedSheet = (() => {
+  try {
+    new CSSStyleSheet()
+    return true
+  } catch (e) {}
+  return false
+})()
+
+const sheetsMap = new Map()
+
 export function updateStyle(id: string, content: string) {
-  const linkId = `vite-css-${id}`
-  let link = document.getElementById(linkId)
-  if (!link) {
-    link = document.createElement('style')
-    link.id = linkId
-    link.setAttribute('type', 'text/css')
-    document.head.appendChild(link)
+  let style = sheetsMap.get(id)
+  if (supportsConstructedSheet && !content.includes('@import')) {
+    if (style && !(style instanceof CSSStyleSheet)) {
+      removeStyle(id)
+      style = undefined
+    }
+
+    if (!style) {
+      style = new CSSStyleSheet()
+      style.replaceSync(content)
+      // @ts-ignore
+      document.adoptedStyleSheets = [...document.adoptedStyleSheets, style]
+    } else {
+      style.replaceSync(content)
+    }
+  } else {
+    if (style && !(style instanceof HTMLStyleElement)) {
+      removeStyle(id)
+      style = undefined
+    }
+
+    if (!style) {
+      style = document.createElement('style')
+      style.setAttribute('type', 'text/css')
+      style.innerHTML = content
+      document.head.appendChild(style)
+    } else {
+      style.innerHTML = content
+    }
   }
-  link.innerHTML = content
+  sheetsMap.set(id, style)
+}
+
+function removeStyle(id: string) {
+  let style = sheetsMap.get(id)
+  if (style) {
+    if (style instanceof CSSStyleSheet) {
+      // @ts-ignore
+      const index = document.adoptedStyleSheets.indexOf(style)
+      // @ts-ignore
+      document.adoptedStyleSheets = document.adoptedStyleSheets.filter(
+        (s: CSSStyleSheet) => s !== style
+      )
+    } else {
+      document.head.removeChild(style)
+    }
+    sheetsMap.delete(id)
+  }
 }
 
 async function updateModule(
   id: string,
   changedPath: string,
-  timestamp: string
+  timestamp: number
 ) {
-  const mod = jsHotModuleMap.get(id)
+  const mod = hotModulesMap.get(id)
   if (!mod) {
     console.error(
-      `[vite] got js update notification but no client callback was registered. Something is wrong.`
+      `[vite] got js update notification for "${id}" but no client callback ` +
+        `was registered. Something is wrong.`
     )
+    console.error(hotModulesMap)
     return
   }
 
@@ -211,29 +290,33 @@ async function updateModule(
       ? deps.some((dep) => modulesToUpdate.has(dep))
       : modulesToUpdate.has(deps)
   })
-  // reset callbacks on self update since they are going to be registered again
-  if (isSelfUpdate) {
-    mod.callbacks = []
-  }
 
   await Promise.all(
     Array.from(modulesToUpdate).map(async (dep) => {
-      const disposer = jsDisposeMap.get(dep)
-      if (disposer) await disposer()
-      const newMod = await import(dep + `?t=${timestamp}`)
-      moduleMap.set(dep, newMod)
+      const disposer = disposeMap.get(dep)
+      if (disposer) await disposer(dataMap.get(dep))
+      try {
+        const newMod = await import(
+          dep + (dep.includes('?') ? '&' : '?') + `t=${timestamp}`
+        )
+        moduleMap.set(dep, newMod)
+      } catch (e) {
+        warnFailedFetch(e, dep)
+      }
     })
   )
 
-  for (const { deps, fn } of callbacks) {
-    if (Array.isArray(deps)) {
-      fn(deps.map((dep) => moduleMap.get(dep)))
-    } else {
-      fn(moduleMap.get(deps))
+  return () => {
+    for (const { deps, fn } of callbacks) {
+      if (Array.isArray(deps)) {
+        fn(deps.map((dep) => moduleMap.get(dep)))
+      } else {
+        fn(moduleMap.get(deps))
+      }
     }
-  }
 
-  console.log(`[vite]: js module hot updated: `, id)
+    console.log(`[vite]: js module hot updated: `, id)
+  }
 }
 
 interface HotModule {
@@ -246,33 +329,67 @@ interface HotCallback {
   fn: (modules: object | object[]) => void
 }
 
-const jsHotModuleMap = new Map<string, HotModule>()
-const jsDisposeMap = new Map<string, () => void | Promise<void>>()
+const hotModulesMap = new Map<string, HotModule>()
+const disposeMap = new Map<string, (data: any) => void | Promise<void>>()
+const dataMap = new Map<string, any>()
 const customUpdateMap = new Map<string, ((customData: any) => void)[]>()
 
-export const hot = {
-  accept(
-    id: string,
-    deps: HotCallback['deps'],
-    callback: HotCallback['fn'] = () => {}
-  ) {
-    const mod: HotModule = jsHotModuleMap.get(id) || {
-      id,
-      callbacks: []
-    }
-    mod.callbacks.push({ deps, fn: callback })
-    jsHotModuleMap.set(id, mod)
-  },
-
-  dispose(id: string, cb: () => void) {
-    jsDisposeMap.set(id, cb)
-  },
-
-  on(event: string, cb: () => void) {
-    const existing = customUpdateMap.get(event) || []
-    existing.push(cb)
-    customUpdateMap.set(event, existing)
+export const createHotContext = (id: string) => {
+  if (!dataMap.has(id)) {
+    dataMap.set(id, {})
   }
+
+  // when a file is hot updated, a new context is created
+  // clear its stale callbacks
+  const mod = hotModulesMap.get(id)
+  if (mod) {
+    mod.callbacks = []
+  }
+
+  const hot = {
+    get data() {
+      return dataMap.get(id)
+    },
+
+    accept(callback: HotCallback['fn'] = () => {}) {
+      hot.acceptDeps(id, callback)
+    },
+
+    acceptDeps(
+      deps: HotCallback['deps'],
+      callback: HotCallback['fn'] = () => {}
+    ) {
+      const mod: HotModule = hotModulesMap.get(id) || {
+        id,
+        callbacks: []
+      }
+      mod.callbacks.push({
+        deps: deps as HotCallback['deps'],
+        fn: callback
+      })
+      hotModulesMap.set(id, mod)
+    },
+
+    dispose(cb: (data: any) => void) {
+      disposeMap.set(id, cb)
+    },
+
+    // noop, used for static analysis only
+    decline() {},
+
+    invalidate() {
+      location.reload()
+    },
+
+    // custom events
+    on(event: string, cb: () => void) {
+      const existing = customUpdateMap.get(event) || []
+      existing.push(cb)
+      customUpdateMap.set(event, existing)
+    }
+  }
+
+  return hot
 }
 
 function bustSwCache(path: string) {

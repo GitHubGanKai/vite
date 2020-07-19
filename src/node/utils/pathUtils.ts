@@ -1,32 +1,33 @@
-import { Context } from 'koa'
-import path from 'path'
 import slash from 'slash'
-import qs from 'querystring'
+import qs, { ParsedUrlQuery } from 'querystring'
+import resolve from 'resolve'
+import { supportedExts } from '../resolver'
+import { Context } from '../server'
+
+let isRunningWithYarnPnp: boolean
+try {
+  isRunningWithYarnPnp = Boolean(require('pnpapi'))
+} catch {}
 
 export const resolveFrom = (root: string, id: string) =>
-  require.resolve(id, { paths: [root] })
+  resolve.sync(id, {
+    basedir: root,
+    extensions: supportedExts,
+    // necessary to work with pnpm
+    preserveSymlinks: isRunningWithYarnPnp || false
+  })
 
 export const queryRE = /\?.*$/
-export const hashRE = /\#.*$/
+export const hashRE = /#.*$/
 
 export const cleanUrl = (url: string) =>
   url.replace(hashRE, '').replace(queryRE, '')
-
-export const resolveRelativeRequest = (importer: string, id: string) => {
-  const resolved = slash(path.posix.resolve(path.dirname(importer), id))
-  const queryMatch = id.match(queryRE)
-  return {
-    url: resolved,
-    pathname: cleanUrl(resolved),
-    query: queryMatch ? queryMatch[0] : ''
-  }
-}
 
 export const parseWithQuery = (
   id: string
 ): {
   path: string
-  query: Record<string, string | string[] | undefined>
+  query: ParsedUrlQuery
 } => {
   const queryMatch = id.match(queryRE)
   if (queryMatch) {
@@ -40,11 +41,15 @@ export const parseWithQuery = (
     query: {}
   }
 }
+export const bareImportRE = /^[^\/\.]/
 
 const externalRE = /^(https?:)?\/\//
 export const isExternalUrl = (url: string) => externalRE.test(url)
 
-const imageRE = /\.(png|jpe?g|gif|svg|ico)(\?.*)?$/
+const dataUrlRE = /^\s*data:/i
+export const isDataUrl = (url: string) => dataUrlRE.test(url)
+
+const imageRE = /\.(png|jpe?g|gif|svg|ico|webp)(\?.*)?$/
 const mediaRE = /\.(mp4|webm|ogg|mp3|wav|flac|aac)(\?.*)?$/
 const fontsRE = /\.(woff2?|eot|ttf|otf)(\?.*)?$/i
 
@@ -66,4 +71,19 @@ export const isStaticAsset = (file: string) => {
  */
 export const isImportRequest = (ctx: Context): boolean => {
   return ctx.query.import != null
+}
+
+export function parseNodeModuleId(id: string) {
+  const parts = id.split('/')
+  let scope = '',
+    name = '',
+    inPkgPath = ''
+  if (id.startsWith('@')) scope = parts.shift()!
+  name = parts.shift()!
+  inPkgPath = parts.join('/')
+  return {
+    scope,
+    name,
+    inPkgPath
+  }
 }

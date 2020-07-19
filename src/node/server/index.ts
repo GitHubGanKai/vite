@@ -1,6 +1,8 @@
+import path from 'path'
+import fs from 'fs-extra'
 import { RequestListener, Server } from 'http'
 import { ServerOptions } from 'https'
-import Koa from 'koa'
+import Koa, { DefaultState, DefaultContext } from 'koa'
 import chokidar from 'chokidar'
 import { createResolver, InternalResolver } from '../resolver'
 import { moduleRewritePlugin } from './serverPluginModuleRewrite'
@@ -15,88 +17,139 @@ import { esbuildPlugin } from './serverPluginEsbuild'
 import { ServerConfig } from '../config'
 import { createServerTransformPlugin } from '../transform'
 import { serviceWorkerPlugin } from './serverPluginServiceWorker'
-import { htmlPlugin } from './serverPluginHtml'
+import { htmlRewritePlugin } from './serverPluginHtml'
 import { proxyPlugin } from './serverPluginProxy'
 import { createCertificate } from '../utils/createCertificate'
-import fs from 'fs-extra'
-import path from 'path'
+import { cachedRead } from '../utils'
+import { envPlugin } from './serverPluginEnv'
 export { rewriteImports } from './serverPluginModuleRewrite'
+import { sourceMapPlugin, SourceMap } from './serverPluginSourceMap'
+import { webWorkerPlugin } from './serverPluginWebWorker'
+import { wasmPlugin } from './serverPluginWasm'
 
 export type ServerPlugin = (ctx: ServerPluginContext) => void
 
 export interface ServerPluginContext {
   root: string
-  app: Koa
+  app: Koa<State, Context>
   server: Server
   watcher: HMRWatcher
   resolver: InternalResolver
   config: ServerConfig & { __path?: string }
+  port: number
 }
 
-export function createServer(config: ServerConfig = {}): Server {
+export interface State extends DefaultState {}
+
+export type Context = DefaultContext &
+  ServerPluginContext & {
+    read: (filePath: string) => Promise<Buffer | string>
+    map?: SourceMap | null
+  }
+
+export function createServer(config: ServerConfig): Server {
   const {
     root = process.cwd(),
     configureServer = [],
     resolvers = [],
     alias = {},
     transforms = [],
-    optimizeDeps = {}
+    vueCustomBlockTransforms = {},
+    optimizeDeps = {},
+    enableEsbuild = true
   } = config
 
-  const app = new Koa()
+  const app = new Koa<State, Context>()
   const server = resolveServer(config, app.callback())
   const watcher = chokidar.watch(root, {
-    ignored: [/node_modules/]
+    ignored: [/\bnode_modules\b/, /\b\.git\b/]
   }) as HMRWatcher
   const resolver = createResolver(root, resolvers, alias)
 
-  const context = {
+  const context: ServerPluginContext = {
     root,
     app,
     server,
     watcher,
     resolver,
-    config
+    config,
+    // port is exposed on the context for hmr client connection
+    // in case the files are served under a different port
+    port: config.port || 3000
   }
 
+  // attach server context to koa context
+  app.use((ctx, next) => {
+    Object.assign(ctx, context)
+    ctx.read = cachedRead.bind(null, ctx)
+    return next()
+  })
+
   const resolvedPlugins = [
+    // rewrite and source map plugins take highest priority and should be run
+    // after all other middlewares have finished
+    sourceMapPlugin,
+    moduleRewritePlugin,
+    htmlRewritePlugin,
+    // user plugins
     ...(Array.isArray(configureServer) ? configureServer : [configureServer]),
+    envPlugin,
+    moduleResolvePlugin,
     proxyPlugin,
     serviceWorkerPlugin,
     hmrPlugin,
-    moduleRewritePlugin,
-    moduleResolvePlugin,
+    ...(transforms.length || Object.keys(vueCustomBlockTransforms).length
+      ? [
+          createServerTransformPlugin(
+            transforms,
+            vueCustomBlockTransforms,
+            resolver
+          )
+        ]
+      : []),
     vuePlugin,
     cssPlugin,
-    ...(transforms.length ? [createServerTransformPlugin(transforms)] : []),
-    esbuildPlugin,
+    enableEsbuild ? esbuildPlugin : null,
     jsonPlugin,
-    htmlPlugin,
     assetPathPlugin,
+    webWorkerPlugin,
+    wasmPlugin,
     serveStaticPlugin
   ]
-  resolvedPlugins.forEach((m) => m(context))
+  resolvedPlugins.forEach((m) => m && m(context))
 
   const listen = server.listen.bind(server)
-  server.listen = (async (...args: any[]) => {
+  server.listen = (async (port: number, ...args: any[]) => {
     if (optimizeDeps.auto !== false) {
-      await require('../depOptimizer').optimizeDeps(config)
+      await require('../optimizer').optimizeDeps(config)
     }
-    return listen(...args)
+    context.port = port
+    return listen(port, ...args)
   }) as any
 
   return server
 }
 
 function resolveServer(
-  { https = false, httpsOption = {} }: ServerConfig,
+  { https = false, httpsOptions = {}, proxy }: ServerConfig,
   requestListener: RequestListener
 ) {
   if (https) {
-    return require('https').createServer(
-      resolveHttpsConfig(httpsOption),
-      requestListener
-    )
+    if (proxy) {
+      // #484 fallback to http1 when proxy is needed.
+      return require('https').createServer(
+        resolveHttpsConfig(httpsOptions),
+        requestListener
+      )
+    } else {
+      return require('http2').createSecureServer(
+        {
+          ...resolveHttpsConfig(httpsOptions),
+          allowHTTP1: true
+        },
+        requestListener
+      )
+    }
   } else {
     return require('http').createServer(requestListener)
   }
@@ -105,10 +158,10 @@ function resolveServer(
 function resolveHttpsConfig(httpsOption: ServerOptions) {
   const { ca, cert, key, pfx } = httpsOption
   Object.assign(httpsOption, {
-    ca: readFileIfExits(ca),
-    cert: readFileIfExits(cert),
-    key: readFileIfExits(key),
-    pfx: readFileIfExits(pfx)
+    ca: readFileIfExists(ca),
+    cert: readFileIfExists(cert),
+    key: readFileIfExists(key),
+    pfx: readFileIfExists(pfx)
   })
   if (!httpsOption.key || !httpsOption.cert) {
     httpsOption.cert = httpsOption.key = createCertificate()
@@ -116,7 +169,7 @@ function resolveHttpsConfig(httpsOption: ServerOptions) {
   return httpsOption
 }
 
-function readFileIfExits(value?: string | Buffer | any) {
+function readFileIfExists(value?: string | Buffer | any) {
   if (value && !Buffer.isBuffer(value)) {
     try {
       return fs.readFileSync(path.resolve(value as string))

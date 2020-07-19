@@ -1,48 +1,94 @@
 import path from 'path'
 import { Plugin } from 'rollup'
 import { resolveAsset, registerAssets } from './buildPluginAsset'
-import { loadPostcssConfig, parseWithQuery } from '../utils'
-import { Transform, BuildConfig } from '../config'
+import { BuildConfig } from '../config'
 import hash_sum from 'hash-sum'
-import { rewriteCssUrls } from '../utils/cssUtils'
+import {
+  urlRE,
+  compileCss,
+  cssPreprocessLangRE,
+  rewriteCssUrls,
+  isCSSRequest,
+  cssModuleRE
+} from '../utils/cssUtils'
+import {
+  SFCStyleCompileResults,
+  SFCAsyncStyleCompileOptions
+} from '@vue/compiler-sfc'
+import chalk from 'chalk'
+import { CssPreprocessOptions } from '../config'
 
 const debug = require('debug')('vite:build:css')
-
-const urlRE = /(url\(\s*['"]?)([^"')]+)(["']?\s*\))/
 
 const cssInjectionMarker = `__VITE_CSS__`
 const cssInjectionRE = /__VITE_CSS__\(\)/g
 
-export const createBuildCssPlugin = (
-  root: string,
-  publicBase: string,
-  assetsDir: string,
-  minify: BuildConfig['minify'] = false,
+interface BuildCssOption {
+  root: string
+  publicBase: string
+  assetsDir: string
+  minify?: BuildConfig['minify']
+  inlineLimit?: number
+  cssCodeSplit?: boolean
+  preprocessOptions?: CssPreprocessOptions
+  modulesOptions?: SFCAsyncStyleCompileOptions['modulesOptions']
+}
+
+export const createBuildCssPlugin = ({
+  root,
+  publicBase,
+  assetsDir,
+  minify = false,
   inlineLimit = 0,
   cssCodeSplit = true,
-  transforms: Transform[] = []
-): Plugin => {
+  preprocessOptions,
+  modulesOptions = {}
+}: BuildCssOption): Plugin => {
   const styles: Map<string, string> = new Map()
   const assets = new Map<string, Buffer>()
-  transforms = transforms.filter((t) => t.as === 'css')
 
   return {
     name: 'vite:css',
     async transform(css: string, id: string) {
-      let transformed = false
+      if (isCSSRequest(id)) {
+        // if this is a Vue SFC style request, it's already processed by
+        // rollup-plugin-vue and we just need to rewrite URLs + collect it
+        const isVueStyle = /\?vue&type=style/.test(id)
+        const preprocessLang = id.replace(
+          cssPreprocessLangRE,
+          '$2'
+        ) as SFCAsyncStyleCompileOptions['preprocessLang']
 
-      if (transforms.length) {
-        const { path, query } = parseWithQuery(id)
-        for (const t of transforms) {
-          if (t.test(path, query)) {
-            css = await t.transform(css, true, true, path, query)
-            transformed = true
-            break
+        const result = isVueStyle
+          ? css
+          : await compileCss(
+              root,
+              id,
+              {
+                id: '',
+                source: css,
+                filename: id,
+                scoped: false,
+                modules: cssModuleRE.test(id),
+                preprocessLang,
+                preprocessOptions,
+                modulesOptions
+              },
+              true
+            )
+
+        let modules: SFCStyleCompileResults['modules']
+        if (typeof result === 'string') {
+          css = result
+        } else {
+          if (result.errors.length) {
+            console.error(`[vite] error applying css transforms: `)
+            result.errors.forEach(console.error)
           }
+          css = result.code
+          modules = result.modules
         }
-      }
 
-      if (transformed || id.endsWith('.css')) {
         // process url() - register referenced files as assets
         // and rewrite the url to the resolved public path
         if (urlRE.test(css)) {
@@ -70,45 +116,17 @@ export const createBuildCssPlugin = (
           })
         }
 
-        // postcss
-        let modules
-        const postcssConfig = await loadPostcssConfig(root)
-        const expectsModule = id.endsWith('.module.css')
-        if (postcssConfig || expectsModule) {
-          try {
-            const result = await require('postcss')([
-              ...((postcssConfig && postcssConfig.plugins) || []),
-              ...(expectsModule
-                ? [
-                    require('postcss-modules')({
-                      generateScopedName: `[local]_${hash_sum(id)}`,
-                      getJSON(_: string, json: Record<string, string>) {
-                        modules = json
-                      }
-                    })
-                  ]
-                : [])
-            ]).process(css, {
-              ...(postcssConfig && postcssConfig.options),
-              from: id
-            })
-            css = result.css
-          } catch (e) {
-            console.error(`[vite] error applying postcss transforms: `, e)
-          }
-        }
-
         styles.set(id, css)
         return {
           code: modules
             ? `export default ${JSON.stringify(modules)}`
-            : cssCodeSplit
-            ? // If code-splitting CSS, inject a fake marker to avoid the module
-              // from being tree-shaken. This preserves the .css file as a
-              // module in the chunk's metadata so that we can retrive them in
-              // renderChunk.
-              `${cssInjectionMarker}()\n`
-            : ``,
+            : (cssCodeSplit
+                ? // If code-splitting CSS, inject a fake marker to avoid the module
+                  // from being tree-shaken. This preserves the .css file as a
+                  // module in the chunk's metadata so that we can retrieve them in
+                  // renderChunk.
+                  `${cssInjectionMarker}()\n`
+                : ``) + `export default ${JSON.stringify(css)}`,
           map: null
         }
       }
@@ -118,6 +136,7 @@ export const createBuildCssPlugin = (
       if (!cssCodeSplit) {
         return null
       }
+      code = code.replace(cssInjectionRE, '')
       // for each dynamic entry chunk, collect its css and inline it as JS
       // strings.
       if (chunk.isDynamicEntry) {
@@ -128,23 +147,12 @@ export const createBuildCssPlugin = (
             styles.delete(id) // remove inlined css
           }
         }
-        chunkCSS = await minifyCSS(chunkCSS)
-        let isFirst = true
-        code = code.replace(cssInjectionRE, () => {
-          if (isFirst) {
-            isFirst = false
-            // make sure the code is in one line so that source map is preserved.
-            return (
-              `let ${cssInjectionMarker} = document.createElement('style');` +
-              `${cssInjectionMarker}.innerHTML = ${JSON.stringify(chunkCSS)};` +
-              `document.head.appendChild(${cssInjectionMarker});`
-            )
-          } else {
-            return ''
-          }
-        })
-      } else {
-        code = code.replace(cssInjectionRE, '')
+        chunkCSS = minifyCSS(chunkCSS)
+        code =
+          `let ${cssInjectionMarker} = document.createElement('style');` +
+          `${cssInjectionMarker}.innerHTML = ${JSON.stringify(chunkCSS)};` +
+          `document.head.appendChild(${cssInjectionMarker});` +
+          code
       }
       return {
         code,
@@ -160,12 +168,13 @@ export const createBuildCssPlugin = (
       })
       // minify with cssnano
       if (minify) {
-        css = await minifyCSS(css)
+        css = minifyCSS(css)
       }
 
       const cssFileName = `style.${hash_sum(css)}.css`
 
       bundle[cssFileName] = {
+        name: cssFileName,
         isAsset: true,
         type: 'asset',
         fileName: cssFileName,
@@ -177,11 +186,21 @@ export const createBuildCssPlugin = (
   }
 }
 
-let postcss: any
-let cssnano: any
+let CleanCSS: any
 
-async function minifyCSS(css: string) {
-  postcss = postcss || require('postcss')
-  cssnano = cssnano || require('cssnano')
-  return (await postcss(cssnano).process(css, { from: undefined })).css
+function minifyCSS(css: string) {
+  CleanCSS = CleanCSS || require('clean-css')
+  const res = new CleanCSS({ level: 2, rebase: false }).minify(css)
+
+  if (res.errors && res.errors.length) {
+    console.error(chalk.red(`[vite] error when minifying css:`))
+    console.error(res.errors)
+  }
+
+  if (res.warnings && res.warnings.length) {
+    console.error(chalk.yellow(`[vite] warnings when minifying css:`))
+    console.error(res.warnings)
+  }
+
+  return res.styles
 }

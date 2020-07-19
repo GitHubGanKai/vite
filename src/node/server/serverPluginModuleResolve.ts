@@ -1,14 +1,15 @@
 import path from 'path'
 import chalk from 'chalk'
+import fs from 'fs-extra'
 import { ServerPlugin } from '.'
-import { resolveVue, cachedRead } from '../utils'
+import { resolveVue } from '../utils'
 import { URL } from 'url'
-import { resolveOptimizedModule, resolveNodeModule } from '../resolver'
+import { resolveOptimizedModule, resolveNodeModuleFile } from '../resolver'
 
 const debug = require('debug')('vite:resolve')
 
-export const idToFileMap = new Map()
-export const fileToRequestMap = new Map()
+export const moduleIdToFileMap = new Map()
+export const moduleFileToIdMap = new Map()
 
 export const moduleRE = /^\/@modules\//
 
@@ -18,7 +19,7 @@ const getDebugPath = (root: string, p: string) => {
 }
 
 // plugin for resolving /@modules/:id requests.
-export const moduleResolvePlugin: ServerPlugin = ({ root, app, watcher }) => {
+export const moduleResolvePlugin: ServerPlugin = ({ root, app, resolver }) => {
   const vueResolved = resolveVue(root)
 
   app.use(async (ctx, next) => {
@@ -26,21 +27,16 @@ export const moduleResolvePlugin: ServerPlugin = ({ root, app, watcher }) => {
       return next()
     }
 
-    const id = ctx.path.replace(moduleRE, '')
+    // path maybe contain encode chars
+    const id = decodeURIComponent(ctx.path.replace(moduleRE, ''))
     ctx.type = 'js'
 
     const serve = async (id: string, file: string, type: string) => {
-      idToFileMap.set(id, file)
-      fileToRequestMap.set(file, ctx.path)
+      moduleIdToFileMap.set(id, file)
+      moduleFileToIdMap.set(file, ctx.path)
       debug(`(${type}) ${id} -> ${getDebugPath(root, file)}`)
-      await cachedRead(ctx, file)
-
-      // resolved module file is outside of root dir, but is not in node_modules.
-      // this is likely a linked monorepo/workspace, watch the file for HMR.
-      if (!file.startsWith(root) && !/node_modules/.test(file)) {
-        watcher.add(file)
-      }
-      await next()
+      await ctx.read(file)
+      return next()
     }
 
     // special handling for vue runtime in case it's not installed
@@ -49,7 +45,7 @@ export const moduleResolvePlugin: ServerPlugin = ({ root, app, watcher }) => {
     }
 
     // already resolved and cached
-    const cachedPath = idToFileMap.get(id)
+    const cachedPath = moduleIdToFileMap.get(id)
     if (cachedPath) {
       return serve(id, cachedPath, 'cached')
     }
@@ -60,16 +56,40 @@ export const moduleResolvePlugin: ServerPlugin = ({ root, app, watcher }) => {
       return serve(id, optimized, 'optimized')
     }
 
-    const nodeModulePath = resolveNodeModule(root, id)
+    const referer = ctx.get('referer')
+    let importer: string | undefined
+    // this is a map file request from browser dev tool
+    const isMapFile = ctx.path.endsWith('.map')
+    if (referer) {
+      importer = new URL(referer).pathname
+    } else if (isMapFile) {
+      // for some reason Chrome doesn't provide referer for source map requests.
+      // do our best to reverse-infer the importer.
+      importer = ctx.path.replace(/\.map$/, '')
+    }
+
+    const importerFilePath = importer ? resolver.requestToFile(importer) : root
+    const nodeModulePath = resolveNodeModuleFile(importerFilePath, id)
     if (nodeModulePath) {
       return serve(id, nodeModulePath, 'node_modules')
     }
 
-    const importer = new URL(ctx.get('referer')).pathname
+    if (isMapFile && importer) {
+      // the resolveNodeModuleFile doesn't work with linked pkg
+      // our last try: infer from the dir of importer
+      const inferMapPath = path.join(
+        path.dirname(importerFilePath),
+        path.basename(ctx.path)
+      )
+      if (fs.existsSync(inferMapPath)) {
+        return serve(id, inferMapPath, 'map file in linked pkg')
+      }
+    }
+
     console.error(
       chalk.red(
         `[vite] Failed to resolve module import "${id}". ` +
-          `(imported by ${importer})`
+          `(imported by ${importer || 'unknown'})`
       )
     )
     ctx.status = 404

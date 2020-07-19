@@ -1,128 +1,190 @@
-import { ServerPlugin } from '.'
-import { hmrClientId } from './serverPluginHmr'
+import { basename } from 'path'
+import { Context, ServerPlugin } from '.'
 import hash_sum from 'hash-sum'
-import { Context } from 'koa'
-import { isImportRequest, readBody, loadPostcssConfig } from '../utils'
-import { srcImportMap } from './serverPluginVue'
-import { rewriteCssUrls } from '../utils/cssUtils'
+import { cleanUrl, isImportRequest, readBody } from '../utils'
+import { srcImportMap, vueCache } from './serverPluginVue'
+import {
+  compileCss,
+  cssImporterMap,
+  cssPreprocessLangRE,
+  getCssImportBoundaries,
+  recordCssImportChain,
+  rewriteCssUrls,
+  isCSSRequest
+} from '../utils/cssUtils'
+import qs from 'querystring'
+import chalk from 'chalk'
+import { InternalResolver } from '../resolver'
+import { hmrClientPublicPath } from './serverPluginHmr'
 
-interface ProcessedEntry {
-  css: string
-  modules: Record<string, string> | undefined
-}
+export const debugCSS = require('debug')('vite:css')
 
-const processedCSS = new Map<string, ProcessedEntry>()
-
-export const cssPlugin: ServerPlugin = ({
-  root,
-  app,
-  watcher,
-  resolver,
-  config
-}) => {
+export const cssPlugin: ServerPlugin = ({ root, app, watcher, resolver }) => {
   app.use(async (ctx, next) => {
     await next()
     // handle .css imports
     if (
-      ctx.response.is('css') &&
+      isCSSRequest(ctx.path) &&
       // note ctx.body could be null if upstream set status to 304
       ctx.body
     ) {
+      const id = JSON.stringify(hash_sum(ctx.path))
       if (isImportRequest(ctx)) {
-        await processCss(ctx)
+        const { css, modules } = await processCss(root, ctx)
+        ctx.type = 'js'
         // we rewrite css with `?import` to a js module that inserts a style
         // tag linking to the actual raw url
-        ctx.type = 'js'
-        const id = JSON.stringify(hash_sum(ctx.path))
-        let code =
-          `import { updateStyle } from "${hmrClientId}"\n` +
-          `const css = ${JSON.stringify(processedCSS.get(ctx.path)!.css)}\n` +
-          `updateStyle(${id}, css)\n`
-        if (ctx.path.endsWith('.module.css')) {
-          code += `export default ${JSON.stringify(
-            processedCSS.get(ctx.path)!.modules
-          )}`
-        } else {
-          code += `export default css`
-        }
-        ctx.body = code.trim()
-      } else {
-        // raw request, return compiled css
-        if (!processedCSS.has(ctx.path)) {
-          await processCss(ctx)
-        }
-        ctx.type = 'js'
-        ctx.body = `export default ${JSON.stringify(
-          processedCSS.get(ctx.path)!.css
-        )}`
+        ctx.body = codegenCss(id, css, modules)
       }
     }
   })
 
-  // handle hmr
-  const cssTransforms = config.transforms
-    ? config.transforms.filter((t) => t.as === 'css')
-    : []
+  watcher.on('change', (filePath) => {
+    if (isCSSRequest(filePath)) {
+      const publicPath = resolver.fileToRequest(filePath)
 
-  watcher.on('change', (file) => {
-    if (file.endsWith('.css') || cssTransforms.some((t) => t.test(file, {}))) {
-      if (srcImportMap.has(file)) {
-        // this is a vue src import, skip
+      /** filter unused files */
+      if (
+        !cssImporterMap.has(filePath) &&
+        !processedCSS.has(publicPath) &&
+        !srcImportMap.has(filePath)
+      ) {
+        return debugCSS(
+          `${basename(publicPath)} has changed, but it is not currently in use`
+        )
+      }
+
+      if (srcImportMap.has(filePath)) {
+        // handle HMR for <style src="xxx.css">
+        // it cannot be handled as simple css import because it may be scoped
+        const styleImport = srcImportMap.get(filePath)
+        vueCache.del(filePath)
+        vueStyleUpdate(styleImport)
         return
       }
+      // handle HMR for module.css
+      // it cannot be handled as normal css because the js exports may change
+      if (filePath.endsWith('.module.css')) {
+        moduleCssUpdate(filePath, resolver)
+      }
 
-      const publicPath = resolver.fileToRequest(file)
-      const id = hash_sum(publicPath)
-
-      // bust process cache
-      processedCSS.delete(publicPath)
-
-      watcher.send({
-        type: 'style-update',
-        id,
-        path: publicPath,
-        timestamp: Date.now()
-      })
+      const boundaries = getCssImportBoundaries(filePath)
+      if (boundaries.size) {
+        for (let boundary of boundaries) {
+          if (boundary.includes('.module')) {
+            moduleCssUpdate(boundary, resolver)
+          } else if (boundary.includes('.vue')) {
+            vueCache.del(cleanUrl(boundary))
+            vueStyleUpdate(resolver.fileToRequest(boundary))
+          } else {
+            normalCssUpdate(resolver.fileToRequest(boundary))
+          }
+        }
+        return
+      }
+      // no boundaries
+      normalCssUpdate(publicPath)
     }
   })
 
-  async function processCss(ctx: Context) {
-    let css = (await readBody(ctx.body))!
-    let modules
-    const postcssConfig = await loadPostcssConfig(root)
-    const expectsModule = ctx.path.endsWith('.module.css')
-
-    // postcss processing
-    if (postcssConfig || expectsModule) {
-      try {
-        css = (
-          await require('postcss')([
-            ...((postcssConfig && postcssConfig.plugins) || []),
-            ...(expectsModule
-              ? [
-                  require('postcss-modules')({
-                    generateScopedName: `[local]_${hash_sum(ctx.path)}`,
-                    getJSON(_: string, json: Record<string, string>) {
-                      modules = json
-                    }
-                  })
-                ]
-              : [])
-          ]).process(css, {
-            ...(postcssConfig && postcssConfig.options),
-            from: resolver.requestToFile(ctx.path)
-          })
-        ).css
-      } catch (e) {
-        console.error(`[vite] error applying postcss transforms: `, e)
-      }
-    }
-
-    css = await rewriteCssUrls(css, ctx.path)
-
-    processedCSS.set(ctx.path, {
-      css,
-      modules
+  function vueStyleUpdate(styleImport: string) {
+    const publicPath = cleanUrl(styleImport)
+    const index = qs.parse(styleImport.split('?', 2)[1]).index
+    const path = `${publicPath}?type=style&index=${index}`
+    console.log(chalk.green(`[vite:hmr] `) + `${publicPath} updated. (style)`)
+    watcher.send({
+      type: 'style-update',
+      path,
+      changeSrcPath: path,
+      timestamp: Date.now()
     })
   }
+
+  function moduleCssUpdate(filePath: string, resolver: InternalResolver) {
+    // bust process cache
+    processedCSS.delete(resolver.fileToRequest(filePath))
+
+    watcher.handleJSReload(filePath)
+  }
+
+  function normalCssUpdate(publicPath: string) {
+    // bust process cache
+    processedCSS.delete(publicPath)
+
+    watcher.send({
+      type: 'style-update',
+      path: publicPath,
+      changeSrcPath: publicPath,
+      timestamp: Date.now()
+    })
+  }
+
+  interface ProcessedCSS {
+    css: string
+    modules?: Record<string, string>
+  }
+
+  // processed CSS is cached in case the user ticks "disable cache" during dev
+  // which can lead to unnecessary processing on page reload
+  const processedCSS = new Map<string, ProcessedCSS>()
+
+  async function processCss(root: string, ctx: Context): Promise<ProcessedCSS> {
+    // source didn't change (marker added by cachedRead)
+    // just use previously cached result
+    if (ctx.__notModified && processedCSS.has(ctx.path)) {
+      return processedCSS.get(ctx.path)!
+    }
+
+    const css = (await readBody(ctx.body))!
+    const filePath = resolver.requestToFile(ctx.path)
+    const preprocessLang = ctx.path.replace(cssPreprocessLangRE, '$2')
+
+    const result = await compileCss(root, ctx.path, {
+      id: '',
+      source: css,
+      filename: filePath,
+      scoped: false,
+      modules: ctx.path.includes('.module'),
+      preprocessLang,
+      preprocessOptions: ctx.config.cssPreprocessOptions,
+      modulesOptions: ctx.config.cssModuleOptions
+    })
+
+    if (typeof result === 'string') {
+      const res = { css: await rewriteCssUrls(css, ctx.path) }
+      processedCSS.set(ctx.path, res)
+      return res
+    }
+
+    recordCssImportChain(result.dependencies, filePath)
+
+    if (result.errors.length) {
+      console.error(`[vite] error applying css transforms: `)
+      result.errors.forEach(console.error)
+    }
+
+    const res = {
+      css: await rewriteCssUrls(result.code, ctx.path),
+      modules: result.modules
+    }
+    processedCSS.set(ctx.path, res)
+    return res
+  }
+}
+
+export function codegenCss(
+  id: string,
+  css: string,
+  modules?: Record<string, string>
+): string {
+  let code =
+    `import { updateStyle } from "${hmrClientPublicPath}"\n` +
+    `const css = ${JSON.stringify(css)}\n` +
+    `updateStyle(${JSON.stringify(id)}, css)\n`
+  if (modules) {
+    code += `export default ${JSON.stringify(modules)}`
+  } else {
+    code += `export default css`
+  }
+  return code
 }

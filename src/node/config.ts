@@ -1,20 +1,35 @@
 import path from 'path'
 import fs from 'fs-extra'
 import chalk from 'chalk'
-import { createEsbuildPlugin } from './build/buildPluginEsbuild'
-import { ServerPlugin } from './server'
-import { Resolver } from './resolver'
+import dotenv, { DotenvParseOutput } from 'dotenv'
+import dotenvExpand from 'dotenv-expand'
 import { Options as RollupPluginVueOptions } from 'rollup-plugin-vue'
-import { CompilerOptions } from '@vue/compiler-sfc'
+import {
+  CompilerOptions,
+  SFCStyleCompileOptions,
+  SFCAsyncStyleCompileOptions
+} from '@vue/compiler-sfc'
 import Rollup, {
   InputOptions as RollupInputOptions,
   OutputOptions as RollupOutputOptions,
   OutputChunk
 } from 'rollup'
-import { Transform } from './transform'
-import { DepOptimizationOptions } from './depOptimizer'
+import { createEsbuildPlugin } from './build/buildPluginEsbuild'
+import { ServerPlugin } from './server'
+import { Resolver, supportedExts } from './resolver'
+import { Transform, CustomBlockTransform } from './transform'
+import { DepOptimizationOptions } from './optimizer'
 import { IKoaProxiesOptions } from 'koa-proxies'
 import { ServerOptions } from 'https'
+import { lookupFile } from './utils'
+
+export type PreprocessLang = NonNullable<
+  SFCStyleCompileOptions['preprocessLang']
+>
+
+export type PreprocessOptions = SFCStyleCompileOptions['preprocessOptions']
+
+export type CssPreprocessOptions = Record<PreprocessLang, PreprocessOptions>
 
 export { Resolver, Transform }
 
@@ -29,14 +44,21 @@ export interface SharedConfig {
    */
   root?: string
   /**
-   * Import alias. Can only be exact mapping, does not support wildcard syntax.
+   * Import alias. The entries can either be exact request -> request mappings
+   * (exact, no wildcard syntax), or request path -> fs directory mappings.
+   * When using directory mappings, the key **must start and end with a slash**.
    *
    * Example `vite.config.js`:
    * ``` js
    * module.exports = {
    *   alias: {
+   *     // alias package names
    *     'react': '@pika/react',
    *     'react-dom': '@pika/react-dom'
+   *
+   *     // alias a path to a fs directory
+   *     // the key must start and end with a slash
+   *     '/@foo/': path.resolve(__dirname, 'some-special-dir')
    *   }
    * }
    * ```
@@ -71,6 +93,19 @@ export interface SharedConfig {
    */
   vueCompilerOptions?: CompilerOptions
   /**
+   * Transform functions for Vue custom blocks.
+   *
+   * Example `vue.config.js`:
+   * ``` js
+   * module.exports = {
+   *   vueCustomBlockTransforms: {
+   *     i18n: src => `export default Comp => { ... }`
+   *   }
+   * }
+   * ```
+   */
+  vueCustomBlockTransforms?: Record<string, CustomBlockTransform>
+  /**
    * Configure what to use for jsx factory and fragment.
    * @default 'vue'
    */
@@ -82,16 +117,38 @@ export interface SharedConfig {
         factory?: string
         fragment?: string
       }
+  /**
+   * Environment variables
+   */
+  env?: DotenvParseOutput
+  /**
+   * Environment mode
+   */
+  mode?: string
+  /**
+   * CSS preprocess options
+   */
+  cssPreprocessOptions?: CssPreprocessOptions
+  /**
+   * CSS modules options
+   */
+  cssModuleOptions?: SFCAsyncStyleCompileOptions['modulesOptions']
+  /**
+   * Enable esbuild
+   * @default true
+   */
+  enableEsbuild?: boolean
 }
 
 export interface ServerConfig extends SharedConfig {
+  hostname?: string
   port?: number
   open?: boolean
   /**
    * Configure https.
    */
   https?: boolean
-  httpsOption?: ServerOptions
+  httpsOptions?: ServerOptions
   /**
    * Configure custom proxy rules for the dev server. Uses
    * [`koa-proxies`](https://github.com/vagusX/koa-proxies) which in turn uses
@@ -103,15 +160,13 @@ export interface ServerConfig extends SharedConfig {
    * ``` js
    * module.exports = {
    *   proxy: {
-   *     proxy: {
-   *       // string shorthand
-   *       '/foo': 'http://localhost:4567/foo',
-   *       // with options
-   *       '/api': {
-   *         target: 'http://jsonplaceholder.typicode.com',
-   *         changeOrigin: true,
-   *         rewrite: path => path.replace(/^\/api/, '')
-   *       }
+   *     // string shorthand
+   *     '/foo': 'http://localhost:4567/foo',
+   *     // with options
+   *     '/api': {
+   *       target: 'http://jsonplaceholder.typicode.com',
+   *       changeOrigin: true,
+   *       rewrite: path => path.replace(/^\/api/, '')
    *     }
    *   }
    * }
@@ -172,26 +227,19 @@ export interface BuildConfig extends SharedConfig {
    */
   minify?: boolean | 'terser' | 'esbuild'
   /**
-   * Build for server-side rendering
-   * @default false
+   * Build for server-side rendering, only as a CLI flag
+   * for programmatic usage, use `ssrBuild` directly.
+   * @internal
    */
   ssr?: boolean
 
-  // The following are API only and not documented in the CLI. -----------------
+  // The following are API / config only and not documented in the CLI. --------
   /**
    * Will be passed to rollup.rollup()
    *
    * https://rollupjs.org/guide/en/#big-list-of-options
    */
   rollupInputOptions?: RollupInputOptions
-  /**
-   * Will be passed to @rollup/plugin-commonjs
-   * https://github.com/rollup/plugins/tree/commonjs-v11.1.0/packages/commonjs#namedexports
-   * This config can be removed after master branch is released.
-   * But there are some issues blocking it:
-   * https://github.com/rollup/plugins/issues/392
-   */
-  rollupPluginCommonJSNamedExports?: Record<string, string[]>
   /**
    * Will be passed to bundle.generate()
    *
@@ -204,6 +252,11 @@ export interface BuildConfig extends SharedConfig {
    * https://github.com/vuejs/rollup-plugin-vue/blob/next/src/index.ts
    */
   rollupPluginVueOptions?: Partial<RollupPluginVueOptions>
+  /**
+   * Will be passed to @rollup/plugin-node-resolve
+   * https://github.com/rollup/plugins/tree/master/packages/node-resolve#dedupe
+   */
+  rollupDedupe?: string[]
   /**
    * Whether to log asset info to console
    * @default false
@@ -229,6 +282,11 @@ export interface BuildConfig extends SharedConfig {
    * added to the index.html for the chunk passed in
    */
   shouldPreload?: (chunk: OutputChunk) => boolean
+  /**
+   * Enable 'rollup-plugin-vue'
+   * @default true
+   */
+  enableRollupPluginVue?: boolean
 }
 
 export interface UserConfig extends BuildConfig, ServerConfig {
@@ -243,27 +301,38 @@ export interface Plugin
     | 'resolvers'
     | 'configureServer'
     | 'vueCompilerOptions'
+    | 'vueCustomBlockTransforms'
     | 'rollupInputOptions'
     | 'rollupOutputOptions'
+    | 'enableRollupPluginVue'
   > {}
 
-export type ResolvedConfig = UserConfig & { __path?: string }
+export type ResolvedConfig = UserConfig & {
+  /**
+   * Path of config file.
+   */
+  __path?: string
+}
+
+const debug = require('debug')('vite:config')
 
 export async function resolveConfig(
-  configPath: string | undefined
+  mode: string,
+  configPath?: string
 ): Promise<ResolvedConfig | undefined> {
   const start = Date.now()
+  const cwd = process.cwd()
   let config: ResolvedConfig | undefined
   let resolvedPath: string | undefined
   let isTS = false
   if (configPath) {
-    resolvedPath = path.resolve(process.cwd(), configPath)
+    resolvedPath = path.resolve(cwd, configPath)
   } else {
-    const jsConfigPath = path.resolve(process.cwd(), 'vite.config.js')
+    const jsConfigPath = path.resolve(cwd, 'vite.config.js')
     if (fs.existsSync(jsConfigPath)) {
       resolvedPath = jsConfigPath
     } else {
-      const tsConfigPath = path.resolve(process.cwd(), 'vite.config.ts')
+      const tsConfigPath = path.resolve(cwd, 'vite.config.ts')
       if (fs.existsSync(tsConfigPath)) {
         isTS = true
         resolvedPath = tsConfigPath
@@ -272,7 +341,10 @@ export async function resolveConfig(
   }
 
   if (!resolvedPath) {
-    return
+    // load environment variables
+    return {
+      env: loadEnv(mode, cwd)
+    }
   }
 
   try {
@@ -294,14 +366,18 @@ export async function resolveConfig(
       // 2. if we reach here, the file is ts or using es import syntax.
       // transpile es import syntax to require syntax using rollup.
       const rollup = require('rollup') as typeof Rollup
-      const esbuilPlugin = await createEsbuildPlugin(false, {})
+      const esbuildPlugin = await createEsbuildPlugin(false, {})
+      // use node-resolve to support .ts files
+      const nodeResolve = require('@rollup/plugin-node-resolve').nodeResolve({
+        extensions: supportedExts
+      })
       const bundle = await rollup.rollup({
         external: (id: string) =>
           (id[0] !== '.' && !path.isAbsolute(id)) ||
           id.slice(-5, id.length) === '.json',
         input: resolvedPath,
         treeshake: false,
-        plugins: [esbuilPlugin]
+        plugins: [esbuildPlugin, nodeResolve]
       })
 
       const {
@@ -326,9 +402,11 @@ export async function resolveConfig(
       }
     }
 
-    require('debug')('vite:config')(
-      `config resolved in ${Date.now() - start}ms`
-    )
+    config.env = {
+      ...config.env,
+      ...loadEnv(mode, config.root || cwd)
+    }
+    debug(`config resolved in ${Date.now() - start}ms`)
 
     config.__path = resolvedPath
     return config
@@ -382,13 +460,76 @@ function resolvePlugin(config: UserConfig, plugin: Plugin): UserConfig {
       ...config.vueCompilerOptions,
       ...plugin.vueCompilerOptions
     },
-    rollupInputOptions: {
-      ...config.rollupInputOptions,
-      ...plugin.rollupInputOptions
+    vueCustomBlockTransforms: {
+      ...config.vueCustomBlockTransforms,
+      ...plugin.vueCustomBlockTransforms
     },
-    rollupOutputOptions: {
-      ...config.rollupOutputOptions,
-      ...plugin.rollupOutputOptions
+    rollupInputOptions: mergeRollupOptions(
+      config.rollupInputOptions,
+      plugin.rollupInputOptions
+    ),
+    rollupOutputOptions: mergeRollupOptions(
+      config.rollupOutputOptions,
+      plugin.rollupOutputOptions
+    ),
+    enableRollupPluginVue:
+      config.enableRollupPluginVue || plugin.enableRollupPluginVue
+  }
+}
+
+function mergeRollupOptions(to: any, from: any) {
+  if (!to) return from
+  if (!from) return to
+  const res: any = { ...to }
+  for (const key in from) {
+    const existing = res[key]
+    const toMerge = from[key]
+    if (Array.isArray(existing) || Array.isArray(toMerge)) {
+      res[key] = [].concat(existing, toMerge).filter(Boolean)
+    } else {
+      res[key] = toMerge
     }
   }
+  return res
+}
+
+function loadEnv(mode: string, root: string): Record<string, string> {
+  if (mode === 'local') {
+    throw new Error(
+      `"local" cannot be used as a mode name because it conflicts with ` +
+        `the .local postfix for .env files.`
+    )
+  }
+
+  debug(`env mode: ${mode}`)
+  const envFiles = [
+    /** mode local file */ `.env.${mode}.local`,
+    /** mode file */ `.env.${mode}`,
+    /** local file */ `.env.local`,
+    /** default file */ `.env`
+  ]
+
+  const env: Record<string, string> = {}
+  for (const file of envFiles) {
+    const path = lookupFile(root, [file], true)
+    if (path) {
+      const result = dotenv.config({
+        debug: !!process.env.DEBUG || undefined,
+        path
+      })
+      if (result.error) {
+        throw result.error
+      }
+      dotenvExpand(result)
+      for (const key in result.parsed) {
+        // only keys that start with VITE_ are exposed.
+        if (key.startsWith(`VITE_`)) {
+          env[key] = result.parsed![key]
+        }
+      }
+    }
+  }
+
+  debug(`env: %O`, env)
+  return env
 }

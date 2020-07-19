@@ -2,6 +2,7 @@ import path from 'path'
 import chalk from 'chalk'
 import { startService, Service, TransformOptions, Message } from 'esbuild'
 import { SharedConfig } from './config'
+import { cleanUrl } from './utils'
 
 const debug = require('debug')('vite:esbuild')
 
@@ -9,7 +10,10 @@ export const tjsxRE = /\.(tsx?|jsx)$/
 
 export const vueJsxPublicPath = '/vite/jsx'
 
-export const vueJsxFilePath = path.resolve(__dirname, 'vueJsxCompat.js')
+export const vueJsxFilePath = path.resolve(
+  __dirname,
+  '../client/vueJsxCompat.js'
+)
 
 const JsxPresets: Record<
   string,
@@ -46,6 +50,7 @@ const ensureService = async () => {
 
 export const stopService = () => {
   _service && _service.stop()
+  _service = undefined
 }
 
 const sourceMapRE = /\/\/# sourceMappingURL.*/
@@ -53,17 +58,18 @@ const sourceMapRE = /\/\/# sourceMappingURL.*/
 // transform used in server plugins with a more friendly API
 export const transform = async (
   src: string,
-  file: string,
+  request: string,
   options: TransformOptions = {},
   jsxOption?: SharedConfig['jsx']
 ) => {
   const service = await ensureService()
+  const file = cleanUrl(request)
   options = {
     ...options,
     loader: options.loader || (path.extname(file).slice(1) as any),
     sourcemap: true,
-    sourcefile: file,
-    target: 'es2019'
+    sourcefile: request, // ensure source file name contains full query
+    target: 'es2020'
   }
   try {
     const result = await service.transform(src, options)
@@ -95,7 +101,11 @@ export const transform = async (
     console.error(
       chalk.red(`[vite] error while transforming ${file} with esbuild:`)
     )
-    e.errors.forEach((m: Message) => printMessage(m, src))
+    if (e.errors) {
+      e.errors.forEach((m: Message) => printMessage(m, src))
+    } else {
+      console.error(e)
+    }
     debug(`options used: `, options)
     return {
       code: '',
@@ -116,7 +126,7 @@ function printMessage(m: Message, code: string) {
         .map((l) => l.length)
         .reduce((total, l) => total + l + 1, 0) + column
     console.error(
-      require('@vue/compiler-core').generateCodeFrame(code, offset, offset + 1)
+      require('@vue/compiler-dom').generateCodeFrame(code, offset, offset + 1)
     )
   }
 }

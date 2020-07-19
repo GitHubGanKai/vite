@@ -1,4 +1,8 @@
+import fs from 'fs'
+import path from 'path'
 import { ServerPlugin } from '.'
+import { isStaticAsset } from '../utils'
+import chalk from 'chalk'
 
 const send = require('koa-send')
 const debug = require('debug')('vite:history')
@@ -11,10 +15,36 @@ export const serveStaticPlugin: ServerPlugin = ({
   resolver,
   config
 }) => {
-  app.use((ctx, next) => {
+  app.use(async (ctx, next) => {
     // short circuit requests that have already been explicitly handled
     if (ctx.body || ctx.status !== 404) {
       return
+    }
+
+    // warn non-root references to assets under /public/
+    if (ctx.path.startsWith('/public/') && isStaticAsset(ctx.path)) {
+      console.error(
+        chalk.yellow(
+          `[vite] files in the public directory are served at the root path.\n` +
+            `  ${chalk.blue(ctx.path)} should be changed to ${chalk.blue(
+              ctx.path.replace(/^\/public\//, '/')
+            )}.`
+        )
+      )
+    }
+
+    // handle possible user request -> file aliases
+    const expectsHtml =
+      ctx.headers.accept && ctx.headers.accept.includes('text/html')
+    if (!expectsHtml) {
+      const filePath = resolver.requestToFile(ctx.path)
+      if (
+        filePath !== ctx.path &&
+        fs.existsSync(filePath) &&
+        fs.statSync(filePath).isFile()
+      ) {
+        await ctx.read(filePath)
+      }
     }
     return next()
   })
@@ -30,18 +60,8 @@ export const serveStaticPlugin: ServerPlugin = ({
     })
   }
   app.use(require('koa-etag')())
-
-  app.use((ctx, next) => {
-    const redirect = resolver.requestToFile(ctx.path)
-    if (!redirect.startsWith(root)) {
-      // resolver resolved to a file that is outside of project root,
-      // manually send here
-      return send(ctx, redirect, { root: '/' })
-    }
-    return next()
-  })
-
   app.use(require('koa-static')(root))
+  app.use(require('koa-static')(path.join(root, 'public')))
 
   // history API fallback
   app.use(async (ctx, next) => {
@@ -72,7 +92,7 @@ export const serveStaticPlugin: ServerPlugin = ({
 
     debug(`redirecting ${ctx.url} to /index.html`)
     try {
-      await send(ctx, `/index.html`)
+      await send(ctx, `index.html`, { root })
     } catch (e) {
       ctx.url = '/index.html'
       ctx.status = 404
