@@ -87,3 +87,13 @@ export function parseNodeModuleId(id: string) {
     inPkgPath
   }
 }
+
+export function removeUnRelatedHmrQuery(url: string) {
+  const { path, query } = parseWithQuery(url)
+  delete query.t
+  delete query.import
+  if (Object.keys(query).length) {
+    return path + '?' + qs.stringify(query)
+  }
+  return path
+}

@@ -2,7 +2,7 @@ import path from 'path'
 import fs from 'fs-extra'
 import chalk from 'chalk'
 import { Ora } from 'ora'
-import { resolveFrom, lookupFile } from '../utils'
+import { resolveFrom, lookupFile, isStaticAsset } from '../utils'
 import {
   rollup as Rollup,
   RollupOutput,
@@ -20,13 +20,16 @@ import { createBuildResolvePlugin } from './buildPluginResolve'
 import { createBuildHtmlPlugin } from './buildPluginHtml'
 import { createBuildCssPlugin } from './buildPluginCss'
 import { createBuildAssetPlugin } from './buildPluginAsset'
-import { createEsbuildPlugin } from './buildPluginEsbuild'
+import {
+  createEsbuildPlugin,
+  createEsbuildRenderChunkPlugin
+} from './buildPluginEsbuild'
 import { createReplacePlugin } from './buildPluginReplace'
 import { stopService } from '../esbuildService'
-import { BuildConfig } from '../config'
+import { BuildConfig, defaultDefines } from '../config'
 import { createBuildJsTransformPlugin } from '../transform'
 import hash_sum from 'hash-sum'
-import { resolvePostcssOptions } from '../utils/cssUtils'
+import { resolvePostcssOptions, isCSSRequest } from '../utils/cssUtils'
 import { createBuildWasmPlugin } from './buildPluginWasm'
 
 export interface BuildResult {
@@ -146,9 +149,7 @@ export async function createBaseRollupPlugins(
     // vite:resolve
     createBuildResolvePlugin(root, resolver),
     // vite:esbuild
-    enableEsbuild
-      ? await createEsbuildPlugin(options.minify === 'esbuild', options.jsx)
-      : null,
+    enableEsbuild ? await createEsbuildPlugin(options.jsx) : null,
     // vue
     enableRollupPluginVue ? await createVuePlugin(root, options) : null,
     require('@rollup/plugin-json')({
@@ -186,7 +187,9 @@ async function createVuePlugin(
     rollupPluginVueOptions,
     cssPreprocessOptions,
     cssModuleOptions,
-    vueCompilerOptions
+    vueCompilerOptions,
+    vueTransformAssetUrls = {},
+    vueTemplatePreprocessOptions = {}
   }: BuildConfig
 ) {
   const {
@@ -194,11 +197,23 @@ async function createVuePlugin(
     plugins: postcssPlugins
   } = await resolvePostcssOptions(root, true)
 
+  if (typeof vueTransformAssetUrls === 'object') {
+    vueTransformAssetUrls = {
+      includeAbsolute: true,
+      ...vueTransformAssetUrls
+    }
+  }
+
   return require('rollup-plugin-vue')({
     ...rollupPluginVueOptions,
-    transformAssetUrls: {
-      includeAbsolute: true
+    templatePreprocessOptions: {
+      ...vueTemplatePreprocessOptions,
+      pug: {
+        doctype: 'html',
+        ...(vueTemplatePreprocessOptions && vueTemplatePreprocessOptions.pug)
+      }
     },
+    transformAssetUrls: vueTransformAssetUrls,
     postcssOptions,
     postcssPlugins,
     preprocessStyles: true,
@@ -236,17 +251,22 @@ export async function build(options: BuildConfig): Promise<BuildResult> {
     emitAssets = true,
     write = true,
     minify = true,
+    // default build transpile target is es2019 so that it transpiles
+    // optional chaining which terser doesn't handle yet
+    esbuildTarget = 'es2019',
+    enableEsbuild = true,
     silent = false,
     sourcemap = false,
     shouldPreload = null,
     env = {},
-    mode = 'production',
+    mode: configMode = 'production',
+    define: userDefineReplacements,
     cssPreprocessOptions,
     cssModuleOptions = {}
   } = options
 
   const isTest = process.env.NODE_ENV === 'test'
-  process.env.NODE_ENV = mode
+  const resolvedMode = process.env.VITE_ENV || configMode
   const start = Date.now()
 
   let spinner: Ora | undefined
@@ -289,18 +309,33 @@ export async function build(options: BuildConfig): Promise<BuildResult> {
       targetPlatform: 'browser',
       pattern: /(.+)\?worker$/,
       extensions: supportedExts,
-      preserveSource: true // somehow results in slightly smaller bundle
+      sourcemap: false // it's inlined so it bloats the bundle
     })
   )
 
   // user env variables loaded from .env files.
   // only those prefixed with VITE_ are exposed.
-  const userEnvReplacements = Object.keys(env).reduce((replacements, key) => {
+  const userClientEnv: Record<string, string | boolean> = {}
+  const userEnvReplacements: Record<string, string> = {}
+  Object.keys(env).forEach((key) => {
     if (key.startsWith(`VITE_`)) {
-      replacements[`import.meta.env.${key}`] = JSON.stringify(env[key])
+      userEnvReplacements[`import.meta.env.${key}`] = JSON.stringify(env[key])
+      userClientEnv[key] = env[key]
     }
-    return replacements
-  }, {} as Record<string, string>)
+  })
+
+  const builtInClientEnv = {
+    BASE_URL: publicBasePath,
+    MODE: configMode,
+    DEV: resolvedMode !== 'production',
+    PROD: resolvedMode === 'production'
+  }
+  const builtInEnvReplacements: Record<string, string> = {}
+  Object.keys(builtInClientEnv).forEach((key) => {
+    builtInEnvReplacements[`import.meta.env.${key}`] = JSON.stringify(
+      builtInClientEnv[key as keyof typeof builtInClientEnv]
+    )
+  })
 
   // lazy require rollup so that we don't load it when only using the dev server
   // importing it just for the types
@@ -320,16 +355,24 @@ export async function build(options: BuildConfig): Promise<BuildResult> {
       // - which makes it impossible to exclude Vue templates from it since
       // Vue templates are compiled into js and included in chunks.
       createReplacePlugin(
-        (id) => /\.(j|t)sx?$/.test(id) || id.startsWith(`/vite/`),
+        (id) =>
+          !/\?vue&type=template/.test(id) &&
+          // also exclude css and static assets for performance
+          !isCSSRequest(id) &&
+          !isStaticAsset(id),
         {
+          ...defaultDefines,
+          ...userDefineReplacements,
           ...userEnvReplacements,
-          'import.meta.env.BASE_URL': JSON.stringify(publicBasePath),
-          'import.meta.env.MODE': JSON.stringify(mode),
-          'import.meta.env.DEV': String(mode === 'development'),
-          'import.meta.env.PROD': String(mode === 'production'),
+          ...builtInEnvReplacements,
           'import.meta.env.': `({}).`,
-          'process.env.NODE_ENV': JSON.stringify(mode),
+          'import.meta.env': JSON.stringify({
+            ...userClientEnv,
+            ...builtInClientEnv
+          }),
+          'process.env.NODE_ENV': JSON.stringify(resolvedMode),
           'process.env.': `({}).`,
+          'process.env': JSON.stringify({ NODE_ENV: resolvedMode }),
           'import.meta.hot': `false`
         },
         sourcemap
@@ -353,6 +396,9 @@ export async function build(options: BuildConfig): Promise<BuildResult> {
         assetsInlineLimit
       ),
       createBuildWasmPlugin(root, publicBasePath, assetsDir, assetsInlineLimit),
+      enableEsbuild
+        ? createEsbuildRenderChunkPlugin(esbuildTarget, minify === 'esbuild')
+        : undefined,
       // minify with terser
       // this is the default which has better compression, but slow
       // the user can opt-in to use esbuild which is much faster but results

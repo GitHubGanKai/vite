@@ -18,11 +18,18 @@ import {
   importeeMap,
   ensureMapEntry,
   rewriteFileWithHMR,
-  hmrClientPublicPath,
   hmrDirtyFilesMap,
   latestVersionsMap
 } from './serverPluginHmr'
-import { readBody, cleanUrl, isExternalUrl, bareImportRE } from '../utils'
+import { clientPublicPath } from './serverPluginClient'
+import {
+  readBody,
+  cleanUrl,
+  isExternalUrl,
+  bareImportRE,
+  removeUnRelatedHmrQuery,
+  cachedRead
+} from '../utils'
 import chalk from 'chalk'
 import { isCSSRequest } from '../utils/cssUtils'
 import { envPublicPath } from './serverPluginEnv'
@@ -54,20 +61,23 @@ export const moduleRewritePlugin: ServerPlugin = ({
     // we are doing the js rewrite after all other middlewares have finished;
     // this allows us to post-process javascript produced by user middlewares
     // regardless of the extension of the original files.
+    const publicPath = ctx.path
     if (
       ctx.body &&
       ctx.response.is('js') &&
       !isCSSRequest(ctx.path) &&
       !ctx.url.endsWith('.map') &&
       // skip internal client
-      !ctx.path.startsWith(hmrClientPublicPath) &&
-      // only need to rewrite for <script> part in vue files
-      !((ctx.path.endsWith('.vue') || ctx.vue) && ctx.query.type != null)
+      publicPath !== clientPublicPath &&
+      // need to rewrite for <script>\<template> part in vue files
+      !((ctx.path.endsWith('.vue') || ctx.vue) && ctx.query.type === 'style')
     ) {
       const content = await readBody(ctx.body)
-      if (!ctx.query.t && rewriteCache.has(content)) {
+      const cacheKey = publicPath + content
+      const isHmrRequest = !!ctx.query.t
+      if (!isHmrRequest && rewriteCache.has(cacheKey)) {
         debug(`(cached) ${ctx.url}`)
-        ctx.body = rewriteCache.get(content)
+        ctx.body = rewriteCache.get(cacheKey)
       } else {
         await initLexer
         // dynamic import may contain extension-less path,
@@ -76,7 +86,9 @@ export const moduleRewritePlugin: ServerPlugin = ({
         // before we perform hmr analysis.
         // on the other hand, static import is guaranteed to have extension
         // because they must all have gone through module rewrite.
-        const importer = resolver.normalizePublicPath(ctx.path)
+        const importer = removeUnRelatedHmrQuery(
+          resolver.normalizePublicPath(ctx.url)
+        )
         ctx.body = rewriteImports(
           root,
           content!,
@@ -84,7 +96,9 @@ export const moduleRewritePlugin: ServerPlugin = ({
           resolver,
           ctx.query.t
         )
-        rewriteCache.set(content, ctx.body)
+        if (!isHmrRequest) {
+          rewriteCache.set(cacheKey, ctx.body)
+        }
       }
     } else {
       debug(`(skipped) ${ctx.url}`)
@@ -92,10 +106,11 @@ export const moduleRewritePlugin: ServerPlugin = ({
   })
 
   // bust module rewrite cache on file change
-  watcher.on('change', (file) => {
-    const publicPath = resolver.fileToRequest(file)
+  watcher.on('change', async (filePath) => {
+    const publicPath = resolver.fileToRequest(filePath)
+    const cacheKey = publicPath + (await cachedRead(null, filePath)).toString()
     debug(`${publicPath}: cache busted`)
-    rewriteCache.del(publicPath)
+    rewriteCache.del(cacheKey)
   })
 }
 
@@ -173,7 +188,7 @@ export function rewriteImports(
           if (
             importee !== importer &&
             // no need to track hmr client or module dependencies
-            importee !== hmrClientPublicPath
+            importee !== clientPublicPath
           ) {
             currentImportees.add(importee)
             debugHmr(`        ${importer} imports ${importee}`)

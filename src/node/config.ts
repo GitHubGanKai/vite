@@ -7,7 +7,8 @@ import { Options as RollupPluginVueOptions } from 'rollup-plugin-vue'
 import {
   CompilerOptions,
   SFCStyleCompileOptions,
-  SFCAsyncStyleCompileOptions
+  SFCAsyncStyleCompileOptions,
+  SFCTemplateCompileOptions
 } from '@vue/compiler-sfc'
 import Rollup, {
   InputOptions as RollupInputOptions,
@@ -29,7 +30,9 @@ export type PreprocessLang = NonNullable<
 
 export type PreprocessOptions = SFCStyleCompileOptions['preprocessOptions']
 
-export type CssPreprocessOptions = Record<PreprocessLang, PreprocessOptions>
+export type CssPreprocessOptions = Partial<
+  Record<PreprocessLang, PreprocessOptions>
+>
 
 export { Resolver, Transform }
 
@@ -69,6 +72,11 @@ export interface SharedConfig {
    */
   transforms?: Transform[]
   /**
+   * Define global variable replacements.
+   * Entries will be defined on `window` during dev and replaced during build.
+   */
+  define?: Record<string, any>
+  /**
    * Resolvers to map dev server public path requests to/from file system paths,
    * and optionally map module ids to public path requests.
    */
@@ -92,6 +100,18 @@ export interface SharedConfig {
    * https://github.com/vuejs/vue-next/blob/master/packages/compiler-core/src/options.ts
    */
   vueCompilerOptions?: CompilerOptions
+  /**
+   * Configure what tags/attributes to trasnform into asset url imports,
+   * or disable the transform altogether with `false`.
+   */
+  vueTransformAssetUrls?: SFCTemplateCompileOptions['transformAssetUrls']
+  /**
+   * The options for template block preprocessor render.
+   */
+  vueTemplatePreprocessOptions?: Record<
+    string,
+    SFCTemplateCompileOptions['preprocessOptions']
+  >
   /**
    * Transform functions for Vue custom blocks.
    *
@@ -118,10 +138,6 @@ export interface SharedConfig {
         fragment?: string
       }
   /**
-   * Environment variables
-   */
-  env?: DotenvParseOutput
-  /**
    * Environment mode
    */
   mode?: string
@@ -138,6 +154,12 @@ export interface SharedConfig {
    * @default true
    */
   enableEsbuild?: boolean
+  /**
+   * Environment variables parsed from .env files
+   * only ones starting with VITE_ are exposed on `import.meta.env`
+   * @internal
+   */
+  env?: DotenvParseOutput
 }
 
 export interface ServerConfig extends SharedConfig {
@@ -174,13 +196,10 @@ export interface ServerConfig extends SharedConfig {
    */
   proxy?: Record<string, string | IKoaProxiesOptions>
   /**
-   * Whether to use a Service Worker to cache served code. This can greatly
-   * improve full page reload performance, but requires a Service Worker
-   * update + reload on each server restart.
-   *
-   * @default false
+   * A plugin function that configures the dev server. Receives a server plugin
+   * context object just like the internal server plguins. Can also be an array
+   * of multiple server plugin functions.
    */
-  serviceWorker?: boolean
   configureServer?: ServerPlugin | ServerPlugin[]
 }
 
@@ -226,6 +245,13 @@ export interface BuildConfig extends SharedConfig {
    * @default 'terser'
    */
   minify?: boolean | 'terser' | 'esbuild'
+  /**
+   * Transpile target for esbuild.
+   * Defaults to 'es2019' which transpiles optional chaining so it works with
+   * terser.
+   * @default 'es2019'
+   */
+  esbuildTarget?: string
   /**
    * Build for server-side rendering, only as a CLI flag
    * for programmatic usage, use `ssrBuild` directly.
@@ -298,9 +324,12 @@ export interface Plugin
     UserConfig,
     | 'alias'
     | 'transforms'
+    | 'define'
     | 'resolvers'
     | 'configureServer'
     | 'vueCompilerOptions'
+    | 'vueTransformAssetUrls'
+    | 'vueTemplatePreprocessOptions'
     | 'vueCustomBlockTransforms'
     | 'rollupInputOptions'
     | 'rollupOutputOptions'
@@ -366,7 +395,7 @@ export async function resolveConfig(
       // 2. if we reach here, the file is ts or using es import syntax.
       // transpile es import syntax to require syntax using rollup.
       const rollup = require('rollup') as typeof Rollup
-      const esbuildPlugin = await createEsbuildPlugin(false, {})
+      const esbuildPlugin = await createEsbuildPlugin({})
       // use node-resolve to support .ts files
       const nodeResolve = require('@rollup/plugin-node-resolve').nodeResolve({
         extensions: supportedExts
@@ -446,9 +475,14 @@ async function loadConfigFromBundledFile(
 function resolvePlugin(config: UserConfig, plugin: Plugin): UserConfig {
   return {
     ...config,
+    ...plugin,
     alias: {
       ...plugin.alias,
       ...config.alias
+    },
+    define: {
+      ...plugin.define,
+      ...config.define
     },
     transforms: [...(config.transforms || []), ...(plugin.transforms || [])],
     resolvers: [...(config.resolvers || []), ...(plugin.resolvers || [])],
@@ -460,15 +494,23 @@ function resolvePlugin(config: UserConfig, plugin: Plugin): UserConfig {
       ...config.vueCompilerOptions,
       ...plugin.vueCompilerOptions
     },
+    vueTransformAssetUrls: mergeAssetUrlOptions(
+      config.vueTransformAssetUrls,
+      plugin.vueTransformAssetUrls
+    ),
+    vueTemplatePreprocessOptions: {
+      ...config.vueTemplatePreprocessOptions,
+      ...plugin.vueTemplatePreprocessOptions
+    },
     vueCustomBlockTransforms: {
       ...config.vueCustomBlockTransforms,
       ...plugin.vueCustomBlockTransforms
     },
-    rollupInputOptions: mergeRollupOptions(
+    rollupInputOptions: mergeObjectOptions(
       config.rollupInputOptions,
       plugin.rollupInputOptions
     ),
-    rollupOutputOptions: mergeRollupOptions(
+    rollupOutputOptions: mergeObjectOptions(
       config.rollupOutputOptions,
       plugin.rollupOutputOptions
     ),
@@ -477,7 +519,36 @@ function resolvePlugin(config: UserConfig, plugin: Plugin): UserConfig {
   }
 }
 
-function mergeRollupOptions(to: any, from: any) {
+function mergeAssetUrlOptions(
+  to: SFCTemplateCompileOptions['transformAssetUrls'],
+  from: SFCTemplateCompileOptions['transformAssetUrls']
+): SFCTemplateCompileOptions['transformAssetUrls'] {
+  if (from === true) {
+    return to
+  }
+  if (from === false) {
+    return from
+  }
+  if (typeof to === 'boolean') {
+    return from || to
+  }
+  return {
+    ...normalizeAssetUrlOptions(to),
+    ...normalizeAssetUrlOptions(from)
+  }
+}
+
+function normalizeAssetUrlOptions(o: Record<string, any> | undefined) {
+  if (o && Object.keys(o).some((key) => Array.isArray(o[key]))) {
+    return {
+      tags: o
+    }
+  } else {
+    return o
+  }
+}
+
+function mergeObjectOptions(to: any, from: any) {
   if (!to) return from
   if (!from) return to
   const res: any = { ...to }
@@ -502,6 +573,9 @@ function loadEnv(mode: string, root: string): Record<string, string> {
   }
 
   debug(`env mode: ${mode}`)
+
+  const nodeEnv = process.env
+  const clientEnv: Record<string, string> = {}
   const envFiles = [
     /** mode local file */ `.env.${mode}.local`,
     /** mode file */ `.env.${mode}`,
@@ -509,7 +583,6 @@ function loadEnv(mode: string, root: string): Record<string, string> {
     /** default file */ `.env`
   ]
 
-  const env: Record<string, string> = {}
   for (const file of envFiles) {
     const path = lookupFile(root, [file], true)
     if (path) {
@@ -522,14 +595,27 @@ function loadEnv(mode: string, root: string): Record<string, string> {
       }
       dotenvExpand(result)
       for (const key in result.parsed) {
+        const value = (nodeEnv[key] = result.parsed![key])
         // only keys that start with VITE_ are exposed.
         if (key.startsWith(`VITE_`)) {
-          env[key] = result.parsed![key]
+          clientEnv[key] = value
+        }
+        // set NODE_ENV under a different key so that we know this is set from
+        // vite-loaded .env files. Some users may have default NODE_ENV set in
+        // their system.
+        if (key === 'NODE_ENV') {
+          nodeEnv.VITE_ENV = value
         }
       }
     }
   }
 
-  debug(`env: %O`, env)
-  return env
+  debug(`env: %O`, clientEnv)
+  return clientEnv
+}
+
+// TODO move this into Vue plugin when we extract it
+export const defaultDefines = {
+  __VUE_OPTIONS_API__: true,
+  __VUE_PROD_DEVTOOLS__: false
 }
