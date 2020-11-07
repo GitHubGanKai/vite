@@ -16,6 +16,7 @@ import qs from 'querystring'
 import chalk from 'chalk'
 import { InternalResolver } from '../resolver'
 import { clientPublicPath } from './serverPluginClient'
+import { dataToEsm } from '@rollup/pluginutils'
 
 export const debugCSS = require('debug')('vite:css')
 
@@ -70,22 +71,31 @@ export const cssPlugin: ServerPlugin = ({ root, app, watcher, resolver }) => {
 
       const boundaries = getCssImportBoundaries(filePath)
       if (boundaries.size) {
-        for (let boundary of boundaries) {
-          if (boundary.includes('.module')) {
-            moduleCssUpdate(boundary, resolver)
-          } else if (boundary.includes('.vue')) {
-            vueCache.del(cleanUrl(boundary))
-            vueStyleUpdate(resolver.fileToRequest(boundary))
-          } else {
-            normalCssUpdate(resolver.fileToRequest(boundary))
-          }
-        }
+        boundaryCssUpdate(boundaries)
         return
       }
       // no boundaries
       normalCssUpdate(publicPath)
+    } else if (cssImporterMap.has(filePath)) {
+      const boundaries = getCssImportBoundaries(filePath)
+      if (boundaries.size) {
+        boundaryCssUpdate(boundaries)
+      }
     }
   })
+
+  function boundaryCssUpdate(boundaries: Set<string>) {
+    for (let boundary of boundaries) {
+      if (boundary.includes('.module')) {
+        moduleCssUpdate(boundary, resolver)
+      } else if (boundary.includes('.vue')) {
+        vueCache.del(cleanUrl(boundary))
+        vueStyleUpdate(resolver.fileToRequest(boundary))
+      } else {
+        normalCssUpdate(resolver.fileToRequest(boundary))
+      }
+    }
+  }
 
   function vueStyleUpdate(styleImport: string) {
     const publicPath = cleanUrl(styleImport)
@@ -137,7 +147,7 @@ export const cssPlugin: ServerPlugin = ({ root, app, watcher, resolver }) => {
 
     const css = (await readBody(ctx.body))!
     const filePath = resolver.requestToFile(ctx.path)
-    const preprocessLang = ctx.path.replace(cssPreprocessLangRE, '$2')
+    const preprocessLang = (ctx.path.match(cssPreprocessLangRE) || [])[1]
 
     const result = await compileCss(root, ctx.path, {
       id: '',
@@ -182,7 +192,7 @@ export function codegenCss(
     `const css = ${JSON.stringify(css)}\n` +
     `updateStyle(${JSON.stringify(id)}, css)\n`
   if (modules) {
-    code += `export default ${JSON.stringify(modules)}`
+    code += dataToEsm(modules, { namedExports: true })
   } else {
     code += `export default css`
   }

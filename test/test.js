@@ -3,7 +3,6 @@ const path = require('path')
 const execa = require('execa')
 const puppeteer = require('puppeteer')
 const moment = require('moment')
-const { EPERM } = require('constants')
 
 jest.setTimeout(100000)
 
@@ -134,6 +133,15 @@ describe('vite', () => {
           null,
           2
         )
+      )
+    })
+
+    test('config.define', async () => {
+      expect(await getText('.config-define-value')).toMatch(
+        `config.define.value: value`
+      )
+      expect(await getText('.config-define-value-from-js')).toMatch(
+        `config.define.value from js: value`
       )
     })
 
@@ -710,6 +718,14 @@ describe('vite', () => {
           () => getComputedColor(`.style-vars`),
           'rgb(0, 0, 255)'
         )
+        // #748
+        await updateFile('script-setup/TestScriptSetupStyleVars.vue', (c) =>
+          c.replace(`msg="hello"`, `msg="hi"`)
+        )
+        await expectByPolling(
+          () => getText('.test-script-setup-child'),
+          'Child has prop hi'
+        )
       }
     })
 
@@ -717,6 +733,19 @@ describe('vite', () => {
       expect(await getText('.syntax')).toBe('baz')
     })
   }
+
+  fdescribe('build (multi)', () => {
+    beforeAll(async () => {
+      const buildOutput = await execa(binPath, ['build'], {
+        cwd: path.join(tempDir, 'multi-build')
+      })
+      expect(buildOutput.stdout).toMatch('Build completed')
+      expect(buildOutput.stderr).toBe('')
+    })
+
+    test.todo('index.html renders "hello world"')
+    test.todo('index.mobile.html renders "hello mobile"')
+  })
 
   describe('build', () => {
     let staticServer
@@ -772,6 +801,16 @@ describe('vite', () => {
       // should be inside the async chunk
       expect(code).toMatch(colorToMatch)
     })
+
+    test('build manifest', async () => {
+      const manifest = JSON.parse(
+        await fs.readFile(path.join(tempDir, 'dist/_assets/manifest.json'))
+      )
+      const indexPath = manifest['index.js']
+      expect(
+        await fs.stat(path.join(tempDir, `dist/_assets/${indexPath}`))
+      ).toBeTruthy()
+    })
   })
 
   describe('dev', () => {
@@ -806,7 +845,7 @@ describe('vite', () => {
     declareTests(false)
 
     test('hmr (index.html full-reload)', async () => {
-      expect(await getText('title')).toMatch('Vite App')
+      expect(await getText('title')).toMatch('Vite Playground')
       // hmr
       const reload = page.waitForNavigation({
         waitUntil: 'domcontentloaded'
@@ -815,12 +854,12 @@ describe('vite', () => {
         content.replace('Vite App', 'Vite App Test')
       )
       await reload
-      await expectByPolling(() => getText('title'), 'Vite App Test')
+      await expectByPolling(() => getText('title'), 'Vite Playground Test')
     })
 
     test('hmr (html full-reload)', async () => {
       await page.goto('http://localhost:3000/test.html')
-      expect(await getText('title')).toMatch('Vite App')
+      expect(await getText('title')).toMatch('Vite Playground')
       // hmr
       const reload = page.waitForNavigation({
         waitUntil: 'domcontentloaded'
@@ -829,7 +868,7 @@ describe('vite', () => {
         content.replace('Vite App', 'Vite App Test')
       )
       await reload
-      await expectByPolling(() => getText('title'), 'Vite App Test')
+      await expectByPolling(() => getText('title'), 'Vite Playground Test')
     })
 
     // Assert that all edited files are reflected on page reload

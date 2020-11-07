@@ -27,12 +27,12 @@ import {
   cleanUrl,
   isExternalUrl,
   bareImportRE,
-  removeUnRelatedHmrQuery,
-  cachedRead
+  removeUnRelatedHmrQuery
 } from '../utils'
 import chalk from 'chalk'
 import { isCSSRequest } from '../utils/cssUtils'
 import { envPublicPath } from './serverPluginEnv'
+import fs from 'fs-extra'
 
 const debug = require('debug')('vite:rewrite')
 
@@ -67,6 +67,7 @@ export const moduleRewritePlugin: ServerPlugin = ({
       ctx.response.is('js') &&
       !isCSSRequest(ctx.path) &&
       !ctx.url.endsWith('.map') &&
+      !resolver.isPublicRequest(ctx.path) &&
       // skip internal client
       publicPath !== clientPublicPath &&
       // need to rewrite for <script>\<template> part in vue files
@@ -108,7 +109,9 @@ export const moduleRewritePlugin: ServerPlugin = ({
   // bust module rewrite cache on file change
   watcher.on('change', async (filePath) => {
     const publicPath = resolver.fileToRequest(filePath)
-    const cacheKey = publicPath + (await cachedRead(null, filePath)).toString()
+    // #662 use fs.read instead of cacheRead, avoid cache hit when request file
+    // and caused pass `notModified` into transform is always true
+    const cacheKey = publicPath + (await fs.readFile(filePath)).toString()
     debug(`${publicPath}: cache busted`)
     rewriteCache.del(cacheKey)
   })
@@ -121,6 +124,10 @@ export function rewriteImports(
   resolver: InternalResolver,
   timestamp?: string
 ) {
+  // #806 strip UTF-8 BOM
+  if (source.charCodeAt(0) === 0xfeff) {
+    source = source.slice(1)
+  }
   try {
     let imports: ImportSpecifier[] = []
     try {
@@ -151,9 +158,12 @@ export function rewriteImports(
       for (let i = 0; i < imports.length; i++) {
         const { s: start, e: end, d: dynamicIndex } = imports[i]
         let id = source.substring(start, end)
+        const hasViteIgnore = /\/\*\s*@vite-ignore\s*\*\//.test(id)
         let hasLiteralDynamicId = false
         if (dynamicIndex >= 0) {
-          const literalIdMatch = id.match(/^(?:'([^']+)'|"([^"]+)")$/)
+          // #998 remove comment
+          id = id.replace(/\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm, '')
+          const literalIdMatch = id.match(/^\s*(?:'([^']+)'|"([^"]+)")\s*$/)
           if (literalIdMatch) {
             hasLiteralDynamicId = true
             id = literalIdMatch[1] || literalIdMatch[2]
@@ -194,8 +204,10 @@ export function rewriteImports(
             debugHmr(`        ${importer} imports ${importee}`)
             ensureMapEntry(importerMap, importee).add(importer)
           }
-        } else if (id !== 'import.meta') {
-          debug(`[vite] ignored dynamic import(${id})`)
+        } else if (id !== 'import.meta' && !hasViteIgnore) {
+          console.warn(
+            chalk.yellow(`[vite] ignored dynamic import(${id}) in ${importer}.`)
+          )
         }
       }
 

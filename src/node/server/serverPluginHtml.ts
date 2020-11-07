@@ -2,10 +2,14 @@ import { rewriteImports, ServerPlugin } from './index'
 import { debugHmr, ensureMapEntry, importerMap } from './serverPluginHmr'
 import { clientPublicPath } from './serverPluginClient'
 import { init as initLexer } from 'es-module-lexer'
-import { cleanUrl, readBody, injectScriptToHtml } from '../utils'
+import {
+  cleanUrl,
+  readBody,
+  injectScriptToHtml,
+  transformIndexHtml
+} from '../utils'
 import LRUCache from 'lru-cache'
 import path from 'path'
-import slash from 'slash'
 import chalk from 'chalk'
 
 const debug = require('debug')('vite:rewrite')
@@ -20,12 +24,18 @@ export const htmlRewritePlugin: ServerPlugin = ({
   config
 }) => {
   const devInjectionCode = `\n<script type="module">import "${clientPublicPath}"</script>\n`
-  const scriptRE = /(<script\b[^>]*>)([\s\S]*?)<\/script>/gm
+  const scriptRE = /(<script\b[^>]*type\s*=\s*(?:"module"|'module')[^>]*>)([\s\S]*?)<\/script>/gm
   const srcRE = /\bsrc=(?:"([^"]+)"|'([^']+)'|([^'"\s]+)\b)/
 
   async function rewriteHtml(importer: string, html: string) {
     await initLexer
-    html = html!.replace(scriptRE, (matched, openTag, script) => {
+    html = await transformIndexHtml(
+      html,
+      config.indexHtmlTransforms,
+      'pre',
+      false
+    )
+    html = html.replace(scriptRE, (matched, openTag, script) => {
       if (script) {
         return `${openTag}${rewriteImports(
           root,
@@ -38,7 +48,7 @@ export const htmlRewritePlugin: ServerPlugin = ({
         if (srcAttr) {
           // register script as a import dep for hmr
           const importee = resolver.normalizePublicPath(
-            cleanUrl(slash(path.resolve('/', srcAttr[1] || srcAttr[2])))
+            cleanUrl(path.posix.resolve('/', srcAttr[1] || srcAttr[2]))
           )
           debugHmr(`        ${importer} imports ${importee}`)
           ensureMapEntry(importerMap, importee).add(importer)
@@ -46,7 +56,13 @@ export const htmlRewritePlugin: ServerPlugin = ({
         return matched
       }
     })
-    return injectScriptToHtml(html, devInjectionCode)
+    const processedHtml = injectScriptToHtml(html, devInjectionCode)
+    return await transformIndexHtml(
+      processedHtml,
+      config.indexHtmlTransforms,
+      'post',
+      false
+    )
   }
 
   app.use(async (ctx, next) => {

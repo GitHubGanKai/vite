@@ -32,6 +32,7 @@ Options:
   --config, -c               [string]  use specified config file
   --port                     [number]  port to use for serve
   --open                     [boolean] open browser on server start
+  --entry                    [string]  entry file for build (default: index.html)
   --base                     [string]  public base path for build (default: /)
   --outDir                   [string]  output directory for build (default: dist)
   --assetsDir                [string]  directory under outDir to place assets in (default: assets)
@@ -44,6 +45,7 @@ Options:
   --jsx                      ['vue' | 'preact' | 'react']  choose jsx preset (default: 'vue')
   --jsx-factory              [string]  (default: React.createElement)
   --jsx-fragment             [string]  (default: React.Fragment)
+  --force                    [boolean] force the optimizer to ignore the cache and re-bundle
 `)
 }
 
@@ -61,6 +63,7 @@ console.log(chalk.cyan(`vite v${require('../../package.json').version}`))
 
   const envMode = mode || m || defaultMode
   const options = await resolveOptions(envMode)
+  process.env.NODE_ENV = process.env.NODE_ENV || envMode
   if (!options.command || options.command === 'serve') {
     runServe(options)
   } else if (options.command === 'build') {
@@ -126,7 +129,7 @@ async function resolveOptions(mode: string) {
   return argv
 }
 
-async function runServe(options: UserConfig) {
+function runServe(options: UserConfig) {
   const server = require('./server').createServer(options)
 
   let port = options.port || 3000
